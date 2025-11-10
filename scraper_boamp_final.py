@@ -1,61 +1,94 @@
 import requests
 import os
 from datetime import datetime
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+import warnings
 import psycopg2
 from psycopg2.extras import execute_values
 import time
 import re
+import logging
+
+# Suppress XML parser warning
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class BOAMPScraper:
     def __init__(self):
         self.base_url = "https://www.boamp.fr/api/explore/v2.1/catalog/datasets/boamp-html/records"
         self.db_conn = self.connect_db()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; BOAMPScraper/1.0)'
+        })
         
     def connect_db(self):
-        """Connect to Supabase database"""
-        return psycopg2.connect(
-            host=os.getenv('DB_HOST', 'db.hjekfyirwzlybhnnzcjm.supabase.co'),
-            port=os.getenv('DB_PORT', 5432),
-            database=os.getenv('DB_NAME', 'postgres'),
-            user=os.getenv('DB_USER', 'postgres'),
-            password=os.getenv('DB_PASSWORD', 'Killorgin1973!')
-        )
+        """Connect to Supabase database with error handling"""
+        try:
+            conn = psycopg2.connect(
+                host=os.getenv('DB_HOST', 'db.hjekfyirwzlybhnnzcjm.supabase.co'),
+                port=int(os.getenv('DB_PORT', 5432)),
+                database=os.getenv('DB_NAME', 'postgres'),
+                user=os.getenv('DB_USER', 'postgres'),
+                password=os.getenv('DB_PASSWORD', 'Killorgin1973!')
+            )
+            logger.info("Database connected successfully")
+            return conn
+        except Exception as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
     
     def fetch_tenders(self, limit=100, offset=0):
-        """Fetch tenders from BOAMP API"""
+        """Fetch tenders from BOAMP API with proper error handling"""
         params = {
             'limit': limit,
             'offset': offset,
             'order_by': 'idweb DESC'
         }
         
-        response = requests.get(self.base_url, params=params)
-        
-        if response.status_code == 200:
+        try:
+            response = self.session.get(self.base_url, params=params, timeout=30)
+            response.raise_for_status()
+            
             data = response.json()
-            print(f"Fetched {len(data['results'])} tenders (total: {data['total_count']})")
-            return data['results']
-        else:
-            print(f"Error: {response.status_code}")
-            return []
+            results = data.get('results', [])
+            total_count = data.get('total_count', 0)
+            
+            logger.info(f"Fetched {len(results)} tenders from offset {offset} (total available: {total_count})")
+            return results, total_count
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching tenders at offset {offset}: {e}")
+            return [], 0
     
     def parse_tender(self, tender_data):
-        """Parse HTML and extract tender fields"""
+        """Parse HTML and extract tender fields using XML parser"""
         html = tender_data.get('html', '')
-        soup = BeautifulSoup(html, 'lxml')
         
-        # Extract what we know works
+        # Use XML parser instead of HTML parser
+        soup = BeautifulSoup(html, 'lxml-xml')
+        
+        # Fallback to lxml if lxml-xml isn't available
+        if not soup.find():
+            soup = BeautifulSoup(html, 'lxml')
+        
+        # Extract title
         title_tag = soup.find('title')
-        title = title_tag.text if title_tag else None
+        title = title_tag.text.strip() if title_tag else None
         
         # Notice number
         notice_num = None
-        annonce = soup.find(string=re.compile('Annonce n°'))
+        annonce = soup.find(string=re.compile(r'Annonce n°', re.IGNORECASE))
         if annonce:
             strong = annonce.find_next('strong')
             if strong:
-                notice_num = strong.text
+                notice_num = strong.text.strip()
         
         # Notice type
         notice_type = None
@@ -65,15 +98,23 @@ class BOAMPScraper:
         
         # Department
         department = None
-        dept = soup.find(string=re.compile('Département'))
+        dept = soup.find(string=re.compile(r'Département', re.IGNORECASE))
         if dept:
             dept_num = dept.find_next('strong')
             if dept_num:
-                department = dept_num.text
+                department = dept_num.text.strip()
         
-        # Contract amounts
-        amounts = re.findall(r'(\d[\d\s,]*)\s*euro\(s\)\s*[HT|Ht]', html)
+        # Contract amounts - more robust extraction
+        amounts = re.findall(r'(\d[\d\s,]*)\s*euro\(s\)\s*(?:HT|Ht|ht)', html, re.IGNORECASE)
         contract_amounts = ','.join([a.replace(' ', '').replace(',', '') for a in amounts[:3]]) if amounts else None
+        
+        # Extract publication date if available
+        pub_date = tender_data.get('dateparution')
+        if pub_date:
+            try:
+                pub_date = datetime.strptime(pub_date, '%Y-%m-%d')
+            except:
+                pub_date = None
         
         return {
             'idweb': tender_data.get('idweb'),
@@ -82,77 +123,168 @@ class BOAMPScraper:
             'notice_type': notice_type,
             'department': department,
             'contract_amounts': contract_amounts,
+            'publication_date': pub_date,
             'html_content': html,
             'scraped_at': datetime.now()
         }
     
     def save_to_db(self, tenders):
-        """Save parsed tenders to database"""
+        """Save parsed tenders to database with conflict handling"""
         if not tenders:
-            return
+            return 0
             
         cursor = self.db_conn.cursor()
         
-        # Create table with parsed fields
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS france_boamp_parsed (
-                id SERIAL PRIMARY KEY,
-                idweb TEXT UNIQUE,
-                title TEXT,
-                notice_number TEXT,
-                notice_type TEXT,
-                department TEXT,
-                contract_amounts TEXT,
-                html_content TEXT,
-                scraped_at TIMESTAMP
-            )
-        """)
-        
-        # Insert tenders
-        values = [(t['idweb'], t['title'], t['notice_number'], t['notice_type'], 
-                   t['department'], t['contract_amounts'], t['html_content'], t['scraped_at']) 
-                  for t in tenders]
-        
-        execute_values(cursor, """
-            INSERT INTO france_boamp_parsed 
-            (idweb, title, notice_number, notice_type, department, contract_amounts, html_content, scraped_at)
-            VALUES %s
-            ON CONFLICT (idweb) DO NOTHING
-        """, values)
-        
-        self.db_conn.commit()
-        print(f"Saved {cursor.rowcount} new tenders")
+        try:
+            # Create table with parsed fields
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS france_boamp_parsed (
+                    id SERIAL PRIMARY KEY,
+                    idweb TEXT UNIQUE NOT NULL,
+                    title TEXT,
+                    notice_number TEXT,
+                    notice_type TEXT,
+                    department TEXT,
+                    contract_amounts TEXT,
+                    publication_date TIMESTAMP,
+                    html_content TEXT,
+                    scraped_at TIMESTAMP DEFAULT NOW(),
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            
+            # Create index on idweb for faster lookups
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_france_boamp_idweb 
+                ON france_boamp_parsed(idweb)
+            """)
+            
+            # Create index on publication_date for analytics
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_france_boamp_pubdate 
+                ON france_boamp_parsed(publication_date)
+            """)
+            
+            # Insert tenders
+            values = [
+                (
+                    t['idweb'], 
+                    t['title'], 
+                    t['notice_number'], 
+                    t['notice_type'], 
+                    t['department'], 
+                    t['contract_amounts'], 
+                    t['publication_date'],
+                    t['html_content'], 
+                    t['scraped_at']
+                ) 
+                for t in tenders
+            ]
+            
+            execute_values(cursor, """
+                INSERT INTO france_boamp_parsed 
+                (idweb, title, notice_number, notice_type, department, 
+                 contract_amounts, publication_date, html_content, scraped_at)
+                VALUES %s
+                ON CONFLICT (idweb) DO NOTHING
+            """, values)
+            
+            saved_count = cursor.rowcount
+            self.db_conn.commit()
+            
+            logger.info(f"Saved {saved_count} new tenders (skipped {len(tenders) - saved_count} duplicates)")
+            return saved_count
+            
+        except Exception as e:
+            logger.error(f"Error saving to database: {e}")
+            self.db_conn.rollback()
+            return 0
     
-    def run(self, total_records=1000):
-        """Main scraping loop"""
-        print(f"Starting BOAMP scrape for {total_records} records...")
+    def run(self, total_records=1000, batch_size=100, max_consecutive_zeros=3):
+        """
+        Main scraping loop with early termination
         
-        batch_size = 100
+        Args:
+            total_records: Maximum records to fetch
+            batch_size: Number of records per API call
+            max_consecutive_zeros: Stop after this many batches with 0 new records
+        """
+        logger.info(f"Starting BOAMP scrape for up to {total_records} records...")
+        
         offset = 0
+        total_processed = 0
         total_saved = 0
+        consecutive_zeros = 0
         
         while offset < total_records:
             # Fetch batch
-            raw_tenders = self.fetch_tenders(limit=batch_size, offset=offset)
+            raw_tenders, total_available = self.fetch_tenders(limit=batch_size, offset=offset)
             
             if not raw_tenders:
+                logger.warning("No tenders returned, stopping")
                 break
             
             # Parse tenders
-            parsed = [self.parse_tender(t) for t in raw_tenders]
+            parsed = []
+            for tender in raw_tenders:
+                try:
+                    parsed_tender = self.parse_tender(tender)
+                    parsed.append(parsed_tender)
+                except Exception as e:
+                    logger.error(f"Error parsing tender {tender.get('idweb')}: {e}")
+                    continue
             
             # Save to database
-            self.save_to_db(parsed)
+            saved_count = self.save_to_db(parsed)
             
-            total_saved += len(parsed)
+            total_processed += len(parsed)
+            total_saved += saved_count
+            
+            # Check for early termination
+            if saved_count == 0:
+                consecutive_zeros += 1
+                logger.warning(f"No new records saved ({consecutive_zeros}/{max_consecutive_zeros})")
+                
+                if consecutive_zeros >= max_consecutive_zeros:
+                    logger.info(f"Stopping early: {max_consecutive_zeros} consecutive batches with 0 new records")
+                    break
+            else:
+                consecutive_zeros = 0  # Reset counter
+            
+            # Update offset for next batch
             offset += batch_size
             
-            # Be polite - wait 2 seconds between requests
-            time.sleep(2)
+            # Check if we've reached the end of available records
+            if offset >= total_available:
+                logger.info(f"Reached end of available records ({total_available})")
+                break
             
-        print(f"Scraping complete. Total processed: {total_saved}")
-        self.db_conn.close()
+            # Be polite - wait between requests
+            time.sleep(2)
+        
+        # Final statistics
+        logger.info("="*60)
+        logger.info(f"Scraping complete!")
+        logger.info(f"Total processed: {total_processed}")
+        logger.info(f"Total saved (new): {total_saved}")
+        logger.info(f"Total duplicates: {total_processed - total_saved}")
+        logger.info(f"Final offset: {offset}")
+        logger.info("="*60)
+        
+        self.cleanup()
+    
+    def cleanup(self):
+        """Close database connection"""
+        if self.db_conn:
+            self.db_conn.close()
+            logger.info("Database connection closed")
 
 if __name__ == "__main__":
     scraper = BOAMPScraper()
-    scraper.run(total_records=1000)
+    
+    # Run with configurable parameters
+    scraper.run(
+        total_records=10000,      # Fetch up to 10k records
+        batch_size=100,           # 100 per batch
+        max_consecutive_zeros=3   # Stop after 3 batches with no new records
+    )

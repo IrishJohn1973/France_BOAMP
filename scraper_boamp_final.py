@@ -61,6 +61,13 @@ class BOAMPScraper:
             total_count = data.get('total_count', 0)
             
             logger.info(f"Fetched {len(results)} tenders from offset {offset} (total available: {total_count})")
+            
+            # Debug: Show date range of fetched records
+            if results:
+                dates = [r.get('dateparution') for r in results if r.get('dateparution')]
+                if dates:
+                    logger.info(f"  Date range in batch: {min(dates)} to {max(dates)}")
+            
             return results, total_count
             
         except requests.exceptions.RequestException as e:
@@ -267,7 +274,7 @@ if __name__ == "__main__":
     
     # Run with configurable parameters
     scraper.run(
-        total_records=10000,      # Fetch up to 10k records
+        total_records=50000,      # Fetch up to 50k records to get past duplicates
         batch_size=100,           # 100 per batch
-        max_consecutive_zeros=3   # Stop after 3 batches with no new records
+        max_consecutive_zeros=5   # Stop after 5 batches with no new records (more patient)
     )

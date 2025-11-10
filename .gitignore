@@ -20,3 +20,19 @@ venv/
 
 # Sensitive
 *.log
+
+# Test and debug files
+scraper_debug.py
+scraper_boamp_working.py
+check_*.py
+test_*.py
+
+# Local data
+raw_xmls/
+*.xml
+*.tar.gz
+venv/
+.DS_Store
+
+# Sensitive
+*.log

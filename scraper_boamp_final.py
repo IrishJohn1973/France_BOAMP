@@ -108,14 +108,6 @@ class BOAMPScraper:
         amounts = re.findall(r'(\d[\d\s,]*)\s*euro\(s\)\s*(?:HT|Ht|ht)', html, re.IGNORECASE)
         contract_amounts = ','.join([a.replace(' ', '').replace(',', '') for a in amounts[:3]]) if amounts else None
         
-        # Extract publication date if available
-        pub_date = tender_data.get('dateparution')
-        if pub_date:
-            try:
-                pub_date = datetime.strptime(pub_date, '%Y-%m-%d')
-            except:
-                pub_date = None
-        
         return {
             'idweb': tender_data.get('idweb'),
             'title': title,
@@ -123,7 +115,6 @@ class BOAMPScraper:
             'notice_type': notice_type,
             'department': department,
             'contract_amounts': contract_amounts,
-            'publication_date': pub_date,
             'html_content': html,
             'scraped_at': datetime.now()
         }
@@ -146,7 +137,6 @@ class BOAMPScraper:
                     notice_type TEXT,
                     department TEXT,
                     contract_amounts TEXT,
-                    publication_date TIMESTAMP,
                     html_content TEXT,
                     scraped_at TIMESTAMP DEFAULT NOW(),
                     created_at TIMESTAMP DEFAULT NOW()
@@ -159,12 +149,6 @@ class BOAMPScraper:
                 ON france_boamp_parsed(idweb)
             """)
             
-            # Create index on publication_date for analytics
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_france_boamp_pubdate 
-                ON france_boamp_parsed(publication_date)
-            """)
-            
             # Insert tenders
             values = [
                 (
@@ -174,7 +158,6 @@ class BOAMPScraper:
                     t['notice_type'], 
                     t['department'], 
                     t['contract_amounts'], 
-                    t['publication_date'],
                     t['html_content'], 
                     t['scraped_at']
                 ) 
@@ -184,7 +167,7 @@ class BOAMPScraper:
             execute_values(cursor, """
                 INSERT INTO france_boamp_parsed 
                 (idweb, title, notice_number, notice_type, department, 
-                 contract_amounts, publication_date, html_content, scraped_at)
+                 contract_amounts, html_content, scraped_at)
                 VALUES %s
                 ON CONFLICT (idweb) DO NOTHING
             """, values)

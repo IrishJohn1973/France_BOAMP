@@ -8,6 +8,7 @@ from psycopg2.extras import execute_values
 import time
 import re
 import logging
+import json
 
 warnings.filterwarnings("ignore")
 
@@ -17,11 +18,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class BOAMPDailyScraper:
+class BOAMPComprehensiveScraper:
     def __init__(self):
         self.base_url = "https://www.boamp.fr/api/explore/v2.1/catalog/datasets/boamp-html/records"
         self.db_conn = self.connect_db()
         self.session = requests.Session()
+        
+        # Initialize Claude API for award extraction
+        self.use_claude_for_awards = bool(os.environ.get('ANTHROPIC_API_KEY'))
+        if self.use_claude_for_awards:
+            self.anthropic_api_key = os.environ.get('ANTHROPIC_API_KEY')
+            logger.info("✅ Claude API enabled for award extraction")
+        else:
+            logger.info("⚠️ Claude API disabled (ANTHROPIC_API_KEY not set) - using regex fallback")
         
     def connect_db(self):
         try:
@@ -39,41 +48,91 @@ class BOAMPDailyScraper:
             raise
     
     def create_staging_table(self):
-        """Create the france_boamp_daily_staging table with all fields"""
+        """Create comprehensive staging table with all master schema fields"""
         cursor = self.db_conn.cursor()
         
         try:
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS france_boamp_daily_staging (
+                CREATE TABLE IF NOT EXISTS france_boamp_comprehensive (
                     id SERIAL PRIMARY KEY,
                     idweb TEXT UNIQUE NOT NULL,
                     
-                    -- Basic info
-                    title TEXT,
+                    -- Core identification
+                    source TEXT DEFAULT 'BOAMP',
+                    source_id TEXT,
+                    internal_ref TEXT,
                     notice_number TEXT,
                     notice_type TEXT,
                     
+                    -- Title and description
+                    title TEXT,
+                    tender_title TEXT,
+                    short_description TEXT,
+                    full_description TEXT,
+                    language TEXT DEFAULT 'fr',
+                    
                     -- Buyer information
                     buyer_name TEXT,
-                    buyer_type TEXT,
-                    buyer_activity TEXT,
+                    buyer_country TEXT DEFAULT 'FR',
+                    buyer_city TEXT,
+                    buyer_postcode TEXT,
+                    buyer_address TEXT,
+                    buyer_organization_type TEXT,
+                    buyer_sector TEXT,
+                    buyer_region TEXT,
+                    buyer_siret TEXT,
                     
-                    -- Tender information
-                    tender_title TEXT,
-                    description TEXT,
-                    procedure_id TEXT,
-                    internal_id TEXT,
-                    procedure_type TEXT,
+                    -- Contact information
+                    contact_name TEXT,
+                    contact_email TEXT,
+                    contact_phone TEXT,
                     
-                    -- Classification
+                    -- Classification codes
                     cpv_codes TEXT,
+                    cpv_primary TEXT,
                     department TEXT,
+                    
+                    -- Dates and deadlines
+                    published_at TIMESTAMP,
+                    deadline TIMESTAMP,
+                    contract_start_date TIMESTAMP,
+                    contract_end_date TIMESTAMP,
                     
                     -- Financial
                     estimated_value NUMERIC,
+                    value_min NUMERIC,
+                    value_max NUMERIC,
                     contract_amounts TEXT,
+                    currency TEXT DEFAULT 'EUR',
                     
-                    -- Winner information
+                    -- Contract details
+                    contract_duration_months INTEGER,
+                    contract_type TEXT,
+                    procurement_method TEXT,
+                    procedure_type TEXT,
+                    
+                    -- Lot structure
+                    lot_structure TEXT,
+                    number_of_lots INTEGER,
+                    has_lots BOOLEAN,
+                    has_tranches BOOLEAN,
+                    
+                    -- Participation requirements
+                    framework_agreement BOOLEAN,
+                    allows_consortia BOOLEAN,
+                    allows_variants BOOLEAN,
+                    requires_site_visit BOOLEAN,
+                    reserved_contract BOOLEAN,
+                    
+                    -- Execution details
+                    execution_location TEXT,
+                    execution_locations TEXT[],
+                    
+                    -- URLs and access
+                    detail_url TEXT,
+                    external_portal_url TEXT,
+                    
+                    -- Winner information (for award notices)
                     winner_name TEXT,
                     winner_email TEXT,
                     winner_phone TEXT,
@@ -82,8 +141,8 @@ class BOAMPDailyScraper:
                     winner_country TEXT,
                     winner_size TEXT,
                     
-                    -- Dates
-                    published_date TEXT,
+                    -- Additional information
+                    additional_info TEXT,
                     
                     -- Raw data
                     html_content TEXT,
@@ -95,17 +154,22 @@ class BOAMPDailyScraper:
             """)
             
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_france_boamp_daily_idweb 
-                ON france_boamp_daily_staging(idweb)
+                CREATE INDEX IF NOT EXISTS idx_boamp_comp_idweb 
+                ON france_boamp_comprehensive(idweb)
             """)
             
             cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_france_boamp_daily_scraped_at 
-                ON france_boamp_daily_staging(scraped_at)
+                CREATE INDEX IF NOT EXISTS idx_boamp_comp_deadline 
+                ON france_boamp_comprehensive(deadline)
+            """)
+            
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_boamp_comp_cpv 
+                ON france_boamp_comprehensive(cpv_primary)
             """)
             
             self.db_conn.commit()
-            logger.info("✅ Staging table created/verified")
+            logger.info("✅ Comprehensive staging table created/verified")
             
         except Exception as e:
             logger.error(f"❌ Error creating staging table: {e}")
@@ -114,13 +178,11 @@ class BOAMPDailyScraper:
     
     def fetch_recent_tenders(self, hours_back=24, limit=100, offset=0):
         """Fetch tenders from last N hours"""
-        cutoff_date = (datetime.now() - timedelta(hours=hours_back)).strftime('%Y-%m-%d')
-        
         params = {
             'limit': limit,
             'offset': offset,
             'order_by': 'idweb DESC',
-            'where': f"html IS NOT NULL AND dateparution >= '{cutoff_date}'"
+            'where': 'html IS NOT NULL'
         }
         
         try:
@@ -141,316 +203,605 @@ class BOAMPDailyScraper:
             logger.error(f"❌ Error fetching tenders at offset {offset}: {e}")
             return [], 0
     
-    def extract_field(self, soup, field_name, section=None):
-        """Extract a field value by its label - aggressive multi-method approach"""
+    def extract_field(self, soup, field_patterns, section=None):
+        """Extract field using multiple pattern matching - handles BOAMP structure"""
         if section:
             section_div = soup.find(id=re.compile(section))
             if section_div:
                 soup = section_div
         
-        # Method 1: Find by exact text match
-        field = soup.find(text=re.compile(field_name, re.IGNORECASE))
-        if field:
-            # Try multiple extraction strategies
-            parent = field.parent
-            
-            # Strategy A: Next sibling span/div
-            next_elem = field.find_next(['span', 'div', 'p', 'td'])
-            if next_elem and next_elem.text.strip() and next_elem.text.strip() not in [':', '', field_name]:
-                text = next_elem.text.strip()
-                if len(text) > 0 and text != field_name:
-                    return text
-            
-            # Strategy B: Parent's next sibling
-            if parent:
-                next_sib = parent.find_next_sibling()
-                if next_sib and next_sib.text.strip():
-                    text = next_sib.text.strip()
-                    if len(text) > 0 and text != field_name:
-                        return text
-            
-            # Strategy C: Within same parent, find span/strong after label
-            if parent:
-                for elem in parent.find_all(['span', 'strong', 'div']):
-                    text = elem.text.strip()
-                    if text and text != field_name and text != ':' and len(text) > 1:
-                        return text
+        if isinstance(field_patterns, str):
+            field_patterns = [field_patterns]
         
-        # Method 2: Find by label tag
-        label = soup.find('label', text=re.compile(field_name, re.IGNORECASE))
-        if label:
-            # Find associated input or span
-            for_id = label.get('for')
-            if for_id:
-                target = soup.find(id=for_id)
-                if target and target.text.strip():
-                    return target.text.strip()
+        for pattern in field_patterns:
+            # Method 1: Find span with the text
+            spans = soup.find_all('span', class_='fr-text--bold')
+            for span in spans:
+                if re.search(pattern, span.text, re.IGNORECASE):
+                    # Value is the text after the span in the parent div
+                    parent = span.parent
+                    if parent:
+                        # Get all text in parent, then extract what comes after the span
+                        full_text = parent.get_text()
+                        # Remove the label part
+                        value = full_text.replace(span.text, '').strip()
+                        if value and value != ':' and len(value) > 0:
+                            return value
+            
+            # Method 2: Find by text directly
+            field = soup.find(text=re.compile(pattern, re.IGNORECASE))
+            if field:
+                parent = field.parent
+                
+                if parent:
+                    # Get the parent div's text and extract after the label
+                    parent_div = parent.parent if parent.parent else parent
+                    if parent_div:
+                        full_text = parent_div.get_text()
+                        # Split by the pattern and take what comes after
+                        parts = re.split(pattern, full_text, maxsplit=1, flags=re.IGNORECASE)
+                        if len(parts) > 1:
+                            value = parts[1].strip().lstrip(':').strip()
+                            # Stop at next label or newline
+                            value = re.split(r'\n|<span', value)[0].strip()
+                            if value and len(value) > 0:
+                                return value
         
         return None
     
-    def extract_winner_info(self, soup):
-        """Extract winner/contractor information - comprehensive approach"""
+    def extract_field_from_element(self, element, field_pattern):
+        """Extract field value from a specific BeautifulSoup element"""
+        if not element:
+            return None
+        
+        # Find span with the field label
+        spans = element.find_all('span', class_='fr-text--bold')
+        for span in spans:
+            if re.search(field_pattern, span.text, re.IGNORECASE):
+                # Get the next span which should have the value
+                next_span = span.find_next_sibling('span')
+                if next_span and next_span.text.strip() and next_span.text.strip() != ':':
+                    return next_span.text.strip()
+                
+                # Or check if value is in parent div after the label
+                parent = span.parent
+                if parent:
+                    full_text = parent.get_text()
+                    value = full_text.replace(span.text, '').strip().lstrip(':').strip()
+                    if value and len(value) > 1:
+                        return value
+        
+        return None
+    
+    def extract_organizations_section8(self, soup):
+        """Extract all organizations from Section 8 with their IDs"""
+        organizations = {}
+        
+        section_8 = soup.find(id=re.compile('section_8'))
+        if not section_8:
+            return organizations
+        
+        # Find all organization subsections (ORG-XXXX)
+        org_ids = re.findall(r'ORG-\d{4}', section_8.get_text())
+        
+        for org_id in set(org_ids):
+            # Find the section containing this ORG ID
+            org_section = section_8.find(text=re.compile(org_id))
+            if org_section:
+                # Get the parent section containing all org details
+                org_parent = org_section.find_parent('div', class_='section')
+                if org_parent:
+                    org_data = {
+                        'org_id': org_id,
+                        'name': self.extract_field_from_element(org_parent, 'Nom officiel'),
+                        'city': self.extract_field_from_element(org_parent, 'Ville'),
+                        'postal_code': self.extract_field_from_element(org_parent, 'Code postal'),
+                        'country': self.extract_field_from_element(org_parent, 'Pays'),
+                        'email': self.extract_field_from_element(org_parent, 'Adresse électronique'),
+                        'phone': self.extract_field_from_element(org_parent, 'Téléphone'),
+                        'address': self.extract_field_from_element(org_parent, 'Adresse postale'),
+                        'registration': self.extract_field_from_element(org_parent, 'Numéro d\'enregistrement'),
+                    }
+                    organizations[org_id] = org_data
+        
+        return organizations
+    
+    def extract_winner_from_section5(self, soup):
+        """Find which organization won from Section 5 lots"""
+        winning_org_ids = []
+        
+        section_5 = soup.find(id=re.compile('section_5'))
+        if not section_5:
+            return winning_org_ids
+        
+        # Look for "Lauréat de ces lots" sections
+        laureats = section_5.find_all(text=re.compile('Lauréat', re.IGNORECASE))
+        
+        for laureat in laureats:
+            # Find the parent section and look for ORG reference
+            parent = laureat.parent
+            if parent:
+                # Search in the next few siblings/descendants for ORG-XXXX
+                parent_section = parent.find_parent('div', class_='section')
+                if parent_section:
+                    org_matches = re.findall(r'ORG-\d{4}', parent_section.get_text())
+                    winning_org_ids.extend(org_matches)
+        
+        return list(set(winning_org_ids))
+    
+    def extract_award_value(self, soup, html):
+        """Extract award value from Section 5"""
+        award_values = []
+        
+        section_5 = soup.find(id=re.compile('section_5'))
+        if section_5:
+            # Look for "Valeur" or "Montant" fields
+            value_patterns = [
+                r'Valeur\s*:\s*</span>\s*<span>([^<]+)</span>',
+                r'Montant\s*:\s*</span>\s*<span>([^<]+)</span>',
+                r'(\d[\d\s,]+)\s*(?:€|EUR|euro)'
+            ]
+            
+            section_5_text = str(section_5)
+            for pattern in value_patterns:
+                matches = re.findall(pattern, section_5_text, re.IGNORECASE)
+                award_values.extend(matches)
+        
+        return award_values
+    
+    def extract_award_date(self, soup):
+        """Extract award date"""
+        award_date_str = self.extract_field(soup, "Date de conclusion du contrat|Date d'attribution")
+        if award_date_str:
+            return self.parse_date(award_date_str)
+        return None
+    
+    def extract_resultat_section4(self, soup, html):
+        """Extract winner info from 'Avis de résultat' Section 4 plain text format"""
         winner_data = {}
         
-        # Strategy 1: Find by "Lauréat" text
-        laureat = soup.find(text=re.compile('Lauréat de ces lots|Lauréat|Titulaire', re.IGNORECASE))
-        if laureat:
-            org_section = laureat.find_parent('div', class_='section')
-            if org_section:
-                parent = org_section.find_parent('div', class_='section')
-                if parent:
-                    winner_data['winner_name'] = self.extract_field(parent, 'Nom officiel|Nom')
-                    winner_data['winner_email'] = self.extract_field(parent, 'Adresse électronique|Courriel|Email')
-                    winner_data['winner_phone'] = self.extract_field(parent, 'Téléphone|Tél')
-                    winner_data['winner_city'] = self.extract_field(parent, 'Ville')
-                    winner_data['winner_postal_code'] = self.extract_field(parent, 'Code postal')
-                    winner_data['winner_country'] = self.extract_field(parent, 'Pays')
-                    winner_data['winner_size'] = self.extract_field(parent, "Taille de l'opérateur|Taille")
+        # Work with raw HTML instead of parsed soup for Section 4 (lxml parsing issue)
+        section_4_match = re.search(r'id="section_4"[^>]*>(.*?)</div>\s*<hr', html, re.DOTALL)
+        if not section_4_match:
+            return winner_data
         
-        # Strategy 2: Find in Section 8 (Organizations)
-        if not winner_data.get('winner_name'):
-            section_8 = soup.find(id=re.compile('section_8'))
-            if section_8:
-                winner_data['winner_name'] = self.extract_field(section_8, 'Nom officiel|Nom')
-                winner_data['winner_email'] = self.extract_field(section_8, 'Adresse électronique|Courriel|Email')
-                winner_data['winner_phone'] = self.extract_field(section_8, 'Téléphone|Tél')
-                winner_data['winner_city'] = self.extract_field(section_8, 'Ville')
-                winner_data['winner_postal_code'] = self.extract_field(section_8, 'Code postal')
-                winner_data['winner_country'] = self.extract_field(section_8, 'Pays')
+        section_4_text = section_4_match.group(1)
         
-        # Strategy 3: Look for "Contractant" or "Attributaire"
+        # Extract award date: "Date d'attribution : 07/11/25"
+        date_match = re.search(r"Date d'attribution\s*:\s*(\d{2}/\d{2}/\d{2})", section_4_text)
+        if date_match:
+            date_str = date_match.group(1)
+            parts = date_str.split('/')
+            date_str = f"{parts[0]}/{parts[1]}/20{parts[2]}"
+            winner_data['award_date'] = self.parse_date(date_str)
+        
+        # Extract award value - Pattern 1: "Montant Ht  : 200 000,00 Euros"
+        value_match = re.search(r'Montant\s+Ht\s*:\s*([\d\s,]+)', section_4_text, re.IGNORECASE)
+        if value_match:
+            winner_data['award_value'] = self.parse_amount(value_match.group(1))
+        
+        # Extract award value - Pattern 2: "Montant provisoire : Mission de base 574 875 € TTC"
+        if not winner_data.get('award_value'):
+            value_match2 = re.search(r'Montant[^:]*:\s*[^€]*?([\d\s]+)\s*€', section_4_text, re.IGNORECASE)
+            if value_match2:
+                winner_data['award_value'] = self.parse_amount(value_match2.group(1))
+        
+        # Extract winner - Pattern 1: line after "Marché n° : XX.XXX"
+        marche_match = re.search(r'Marché n°\s*:\s*[\d\.]+\s*\n\s*([^\n]+)', section_4_text)
+        if marche_match:
+            winner_line = marche_match.group(1).strip()
+            winner_line = re.sub(r'<[^>]+>', '', winner_line)
+            
+            parts = [p.strip() for p in winner_line.split(',')]
+            
+            if len(parts) >= 1 and parts[0]:
+                winner_data['winner_name'] = parts[0]
+            
+            if len(parts) >= 2:
+                winner_data['winner_address'] = parts[1]
+            
+            if len(parts) >= 3:
+                last_part = parts[-1]
+                postal_match = re.search(r'(\d{5})\s+(.+)', last_part)
+                if postal_match:
+                    winner_data['winner_postal_code'] = postal_match.group(1)
+                    winner_data['winner_city'] = postal_match.group(2).strip()
+        
+        # Extract winner - Pattern 2: "Attribution à l'agence NAME - ADDRESS - POSTAL CITY"
         if not winner_data.get('winner_name'):
-            contractant = soup.find(text=re.compile('Contractant|Attributaire', re.IGNORECASE))
-            if contractant:
-                section = contractant.find_parent('div', class_='section')
-                if section:
-                    winner_data['winner_name'] = self.extract_field(section, 'Nom officiel|Nom')
-                    winner_data['winner_city'] = self.extract_field(section, 'Ville')
+            attrib_match = re.search(r'Attribution à\s+([^<\n]+)', section_4_text, re.IGNORECASE)
+            if attrib_match:
+                winner_line = attrib_match.group(1).strip()
+                # Parse: "l'agence MURISSERIE - 18 rue du Calvaire - 44010 NANTES Cedex 1"
+                # Split by " - " but stop at "Montant"
+                if 'Montant' in winner_line:
+                    winner_line = winner_line.split('Montant')[0].strip()
+                
+                parts = [p.strip() for p in winner_line.split(' - ')]
+                
+                if len(parts) >= 1:
+                    # Remove "l'agence", "la société", etc.
+                    name = re.sub(r"^(l'agence|la société|le|la|l')\s+", '', parts[0], flags=re.IGNORECASE)
+                    if name:
+                        winner_data['winner_name'] = name
+                
+                if len(parts) >= 2:
+                    winner_data['winner_address'] = parts[1]
+                
+                if len(parts) >= 3:
+                    # Last part: "44010 NANTES Cedex 1"
+                    last_part = parts[-1]
+                    postal_match = re.search(r'(\d{5})\s+(.+)', last_part)
+                    if postal_match:
+                        winner_data['winner_postal_code'] = postal_match.group(1)
+                        winner_data['winner_city'] = postal_match.group(2).strip().rstrip('-').strip()
         
         return winner_data
     
+    def extract_award_with_claude(self, html_content, notice_id):
+        """Use Claude API to extract award data with high accuracy"""
+        try:
+            # Strip to relevant text
+            soup = BeautifulSoup(html_content, 'lxml')
+            text_content = soup.get_text(separator='\n', strip=True)
+            
+            # Find Section 4
+            if 'Section 4' in text_content:
+                start_idx = text_content.find('Section 4')
+                relevant_text = text_content[start_idx:start_idx+3000]
+            else:
+                relevant_text = text_content[:3000]
+            
+            prompt = f"""Extract structured data from this French award notice. Return ONLY valid JSON, no other text.
+
+Required fields (use null if not found):
+- winner_name: Company name (remove prefixes like "l'agence", "la société")
+- winner_address: Street address  
+- winner_city: City (remove trailing dashes)
+- winner_postal_code: 5-digit code
+- winner_country: Country (default "France")
+- award_value: Numeric euros (convert "574 875" to 574875.0)
+- award_date: YYYY-MM-DD (convert "07/11/25" to "2025-11-07")
+- contract_number: Contract number
+
+AWARD NOTICE:
+{relevant_text}
+
+JSON only:"""
+
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json"
+                },
+                json={
+                    "model": "claude-haiku-20240307",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": prompt}]
+                },
+                timeout=30
+            )
+            
+            response.raise_for_status()
+            result = response.json()
+            content = result['content'][0]['text'].strip()
+            
+            # Remove markdown code blocks if present
+            content = re.sub(r'```json\n?|\n?```', '', content)
+            
+            award_data = json.loads(content)
+            return award_data
+            
+        except Exception as e:
+            logger.warning(f"   ⚠️ Claude extraction failed for {notice_id}: {e}")
+            return {}
+    
+    def parse_date(self, date_str):
+        """Parse French date format to datetime"""
+        if not date_str:
+            return None
+        
+        try:
+            # Try DD/MM/YYYY HH:MM format
+            if '/' in date_str:
+                parts = re.search(r'(\d{2})/(\d{2})/(\d{4})(?:\s+(\d{2}):(\d{2}))?', date_str)
+                if parts:
+                    day, month, year = parts.group(1), parts.group(2), parts.group(3)
+                    hour = parts.group(4) if parts.group(4) else '00'
+                    minute = parts.group(5) if parts.group(5) else '00'
+                    return datetime.strptime(f"{day}/{month}/{year} {hour}:{minute}", "%d/%m/%Y %H:%M")
+        except:
+            pass
+        
+        return None
+    
     def parse_amount(self, amount_str):
-        """Parse amount string to float"""
+        """Parse amount string to float - handles French format (space=thousands, comma=decimal)"""
         if not amount_str:
             return None
-        clean = amount_str.replace(' ', '').replace(',', '').replace('€', '')
+        # French format: "200 000,00" -> remove spaces (including non-breaking \xa0), comma becomes decimal point
+        clean = amount_str.replace(' ', '').replace('\xa0', '').replace(',', '.').replace('€', '').replace('EUR', '').strip()
         try:
             return float(clean)
         except:
             return None
     
+    def extract_cpv_codes(self, soup, html):
+        """Extract all CPV codes"""
+        cpv_codes = set()
+        
+        # Method 1: Find "Code CPV" labels
+        cpv_labels = soup.find_all(text=re.compile(r'Code.*CPV', re.IGNORECASE))
+        for label in cpv_labels:
+            parent = label.parent
+            if parent:
+                next_elem = parent.find_next(['span', 'div'])
+                if next_elem:
+                    match = re.search(r'\b([0-9]{8})\b', next_elem.text)
+                    if match:
+                        cpv_codes.add(match.group(1))
+        
+        # Method 2: Search in Section 4 and 5
+        for section_id in ['section_4', 'section_5']:
+            section = soup.find(id=section_id)
+            if section:
+                section_text = section.parent.text if section.parent else ''
+                digits = re.findall(r'\b([0-9]{8})\b', section_text)
+                cpv_codes.update(digits)
+        
+        # Method 3: Regex in HTML
+        all_cpv = re.findall(r'CPV[^0-9]{0,100}([0-9]{8})', html, re.IGNORECASE)
+        cpv_codes.update(all_cpv)
+        
+        return sorted(cpv_codes)
+    
     def parse_tender(self, tender_data):
-        """Extract ALL fields from BOAMP tender - aggressive extraction for 90%+ population"""
+        """Extract ALL fields comprehensively"""
         html = tender_data.get('html', '')
         soup = BeautifulSoup(html, 'lxml')
         
-        # If lxml fails, try html.parser
         if not soup.find():
             soup = BeautifulSoup(html, 'html.parser')
         
         data = {
             'idweb': tender_data.get('idweb'),
+            'source_id': tender_data.get('idweb'),
             'html_content': html,
             'scraped_at': datetime.now()
         }
         
-        # ==================== BASIC INFO ====================
-        # Title - multiple strategies
-        title = None
+        # ==================== IDENTIFICATION ====================
+        # Title
         title_tag = soup.find('title')
-        if title_tag:
-            title = title_tag.text.strip()
-        if not title:
-            h1 = soup.find('h1')
-            if h1:
-                title = h1.text.strip()
-        if not title:
-            # Look for "Intitulé" in the document
-            intitule = self.extract_field(soup, 'Intitulé')
-            if intitule:
-                title = intitule
-        data['title'] = title
+        data['title'] = title_tag.text.strip() if title_tag else None
         
-        # Notice number - multiple patterns
-        notice_num = None
-        patterns = [
+        # Notice number
+        notice_patterns = [
             r'Annonce n[°o]?\s*[:：]?\s*([A-Z0-9-]+)',
-            r'Avis n[°o]?\s*[:：]?\s*([A-Z0-9-]+)',
-            r'Notice\s*[:：]?\s*([A-Z0-9-]+)'
+            r'Avis n[°o]?\s*[:：]?\s*([A-Z0-9-]+)'
         ]
-        for pattern in patterns:
+        for pattern in notice_patterns:
             match = re.search(pattern, html, re.IGNORECASE)
             if match:
-                notice_num = match.group(1).strip()
+                data['notice_number'] = match.group(1).strip()
                 break
-        if not notice_num:
-            annonce = soup.find(text=re.compile(r'Annonce n[°o]?', re.IGNORECASE))
-            if annonce:
-                strong = annonce.find_next('strong')
-                if strong:
-                    notice_num = strong.text.strip()
-        data['notice_number'] = notice_num
+        
+        data['internal_ref'] = self.extract_field(soup, ['Identifiant interne', 'Référence'])
         
         # Notice type
-        notice_type = None
         doc_titre = soup.find(id='doc_titre')
-        if doc_titre:
-            notice_type = doc_titre.text.strip()
-        if not notice_type:
-            notice_type = self.extract_field(soup, "Type d'avis|Type avis")
-        data['notice_type'] = notice_type
+        data['notice_type'] = doc_titre.text.strip() if doc_titre else None
         
         # ==================== BUYER INFORMATION ====================
-        # Try section 1 first, then general search
-        buyer_name = self.extract_field(soup, 'Nom officiel', section='section_1')
-        if not buyer_name:
-            buyer_name = self.extract_field(soup, "Nom et adresse de l'acheteur|Acheteur|Organisme")
-        if not buyer_name:
-            # Look for organization name in strong tags near "acheteur"
-            acheteur = soup.find(text=re.compile('acheteur|organisme', re.IGNORECASE))
-            if acheteur:
-                strong = acheteur.find_next('strong')
-                if strong and len(strong.text.strip()) > 3:
-                    buyer_name = strong.text.strip()
-        data['buyer_name'] = buyer_name
+        # Buyer name - special handling for BOAMP structure
+        buyer_span = soup.find('span', class_='fr-text--bold', string=lambda t: 'Nom complet' in t if t else False)
+        if buyer_span and buyer_span.parent:
+            full_text = buyer_span.parent.get_text()
+            # Remove the label and clean
+            value = full_text.replace(buyer_span.text, '').strip()
+            data['buyer_name'] = value if value else None
         
-        data['buyer_type'] = self.extract_field(soup, 'Forme juridique|Type de pouvoir|Statut juridique')
-        data['buyer_activity'] = self.extract_field(soup, 'Activité du pouvoir adjudicateur|Activité principale|Secteur')
+        if not data.get('buyer_name'):
+            data['buyer_name'] = self.extract_field(soup, 'Nom complet de l\'acheteur', section='section_1')
+        
+        data['buyer_city'] = self.extract_field(soup, 'Ville')
+        data['buyer_postcode'] = self.extract_field(soup, 'Code postal')
+        data['buyer_siret'] = self.extract_field(soup, 'N° National d\'identification')
+        data['buyer_organization_type'] = self.extract_field(soup, ['Forme juridique', 'Type de pouvoir'])
+        data['buyer_sector'] = self.extract_field(soup, 'Activité du pouvoir adjudicateur')
+        
+        # ==================== CONTACT INFORMATION ====================
+        data['contact_name'] = self.extract_field(soup, 'Nom du contact')
+        data['contact_email'] = self.extract_field(soup, 'Adresse mail du contact')
+        data['contact_phone'] = self.extract_field(soup, 'Numéro de téléphone du contact')
         
         # ==================== TENDER INFORMATION ====================
-        tender_title = self.extract_field(soup, 'Titre|Intitulé', section='section_2')
-        if not tender_title:
-            tender_title = self.extract_field(soup, "Objet du marché|Description sommaire")
-        # If still empty, use main title
-        if not tender_title and data.get('title'):
-            tender_title = data['title']
-        data['tender_title'] = tender_title
+        data['tender_title'] = self.extract_field(soup, 'Intitulé du marché', section='section_4')
+        if not data['tender_title']:
+            data['tender_title'] = data['title']
         
-        # Description - try multiple fields
-        description = self.extract_field(soup, 'Description', section='section_2')
-        if not description:
-            description = self.extract_field(soup, 'Objet|Description courte|Description détaillée')
-        if not description:
-            # Look for longest paragraph in section 2
-            section_2 = soup.find(id=re.compile('section_2'))
-            if section_2:
-                paragraphs = section_2.find_all('p')
-                if paragraphs:
-                    longest = max(paragraphs, key=lambda p: len(p.text))
-                    if len(longest.text.strip()) > 50:
-                        description = longest.text.strip()
-        data['description'] = description
+        data['full_description'] = self.extract_field(soup, ['Description', 'Objet'])
+        data['short_description'] = data['full_description'][:500] if data.get('full_description') else None
         
-        data['procedure_id'] = self.extract_field(soup, 'Identifiant de la procédure|Référence de la procédure|Numéro de marché')
-        data['internal_id'] = self.extract_field(soup, 'Identifiant interne|Référence interne')
-        data['procedure_type'] = self.extract_field(soup, 'Type de procédure|Procédure')
+        data['contract_type'] = self.extract_field(soup, 'Type de marché')
+        data['procedure_type'] = self.extract_field(soup, 'Type de procédure')
+        data['procurement_method'] = self.extract_field(soup, 'Technique d\'achat')
         
         # ==================== CPV CODES ====================
-        cpv_codes = set()
+        cpv_list = self.extract_cpv_codes(soup, html)
+        data['cpv_codes'] = ','.join(cpv_list) if cpv_list else None
+        data['cpv_primary'] = cpv_list[0] if cpv_list else None
         
-        # Method 1: Find all elements with text 'cpv'
-        cpv_elements = soup.find_all(text=re.compile('cpv', re.IGNORECASE))
-        for cpv in cpv_elements:
-            # Look for numeric codes nearby
-            parent = cpv.parent
-            if parent:
-                for elem in parent.find_all(['span', 'strong', 'code']):
-                    text = elem.text.strip().replace('-', '').replace(' ', '')
-                    if text.isdigit() and len(text) == 8:
-                        cpv_codes.add(elem.text.strip())
+        # ==================== DATES ====================
+        deadline_str = self.extract_field(soup, 'Date et heure limite de réception des plis')
+        data['deadline'] = self.parse_date(deadline_str)
         
-        # Method 2: Regex search for CPV patterns
-        cpv_pattern = r'(?:cpv|CPV)[:\s]*([0-9]{8}(?:-[0-9])?)'
-        cpv_matches = re.findall(cpv_pattern, html, re.IGNORECASE)
-        cpv_codes.update(cpv_matches)
-        
-        # Method 3: Look for 8-digit numbers near "Classification"
-        classification = soup.find(text=re.compile('Classification', re.IGNORECASE))
-        if classification:
-            section = classification.find_parent('div')
-            if section:
-                digits = re.findall(r'\b([0-9]{8})\b', section.text)
-                cpv_codes.update(digits)
-        
-        data['cpv_codes'] = ','.join(sorted(cpv_codes)) if cpv_codes else None
+        published_str = self.extract_field(soup, 'Date d\'envoi du présent avis')
+        data['published_at'] = self.parse_date(published_str)
         
         # ==================== FINANCIAL ====================
-        # Estimated value
-        estimated_value = self.extract_field(soup, 'Valeur estimée hors TVA|Valeur estimée|Montant estimé')
-        if not estimated_value:
-            # Regex search
-            value_match = re.search(r'Valeur[^:]*:\s*([\d\s,.]+)\s*(?:€|EUR|euro)', html, re.IGNORECASE)
-            if value_match:
-                estimated_value = value_match.group(1)
-        data['estimated_value'] = self.parse_amount(estimated_value) if estimated_value else None
+        estimated_value = self.extract_field(soup, 'Valeur estimée')
+        data['estimated_value'] = self.parse_amount(estimated_value)
         
-        # Contract amounts - comprehensive extraction
-        amounts = []
-        # Pattern 1: X euro(s) HT
-        amounts.extend(re.findall(r'(\d[\d\s,]*)\s*euro\(s\)\s*(?:HT|Ht|ht)', html, re.IGNORECASE))
-        # Pattern 2: X EUR
-        amounts.extend(re.findall(r'(\d[\d\s,]+)\s*(?:EUR|€)', html))
-        # Pattern 3: Montant: X
-        amounts.extend(re.findall(r'[Mm]ontant[^:]*:\s*([\d\s,]+)', html))
-        
-        # Clean and deduplicate
+        # Extract amounts from description
+        amounts = re.findall(r'(\d[\d\s,]*)\s*euro\(s\)?\s*(?:HT|Ht|ht)?', html, re.IGNORECASE)
         clean_amounts = []
         for amt in amounts:
             cleaned = amt.replace(' ', '').replace(',', '')
-            if cleaned.isdigit() and int(cleaned) > 100:  # Minimum threshold
+            if cleaned.isdigit() and int(cleaned) > 100:
                 clean_amounts.append(cleaned)
-        
         data['contract_amounts'] = ','.join(clean_amounts[:5]) if clean_amounts else None
         
-        # ==================== WINNER INFORMATION ====================
-        winner = self.extract_winner_info(soup)
-        data.update(winner)
+        # ==================== CONTRACT DETAILS ====================
+        duration_str = self.extract_field(soup, 'Durée du marché')
+        if duration_str:
+            match = re.search(r'(\d+)', duration_str)
+            if match:
+                data['contract_duration_months'] = int(match.group(1))
         
-        # ==================== DATES ====================
-        published_date = self.extract_field(soup, "Date d'envoi de l'avis|Date de publication|Date envoi")
-        if not published_date:
-            # Regex for date patterns
-            date_match = re.search(r'\b(\d{2}/\d{2}/\d{4})\b', html)
-            if date_match:
-                published_date = date_match.group(1)
-        data['published_date'] = published_date
+        # ==================== LOT STRUCTURE ====================
+        has_lots_str = self.extract_field(soup, 'Marché alloti')
+        data['has_lots'] = has_lots_str == 'Oui' if has_lots_str else None
+        
+        has_tranches_str = self.extract_field(soup, 'La consultation comporte des tranches')
+        data['has_tranches'] = has_tranches_str == 'Oui' if has_tranches_str else None
+        
+        if data['has_lots']:
+            # Count lot descriptions
+            lot_sections = soup.find_all(text=re.compile('Description du lot', re.IGNORECASE))
+            data['number_of_lots'] = len(lot_sections) if lot_sections else None
+            data['lot_structure'] = 'multiple' if data['number_of_lots'] and data['number_of_lots'] > 1 else 'single'
+        
+        # ==================== PARTICIPATION REQUIREMENTS ====================
+        consortia_str = self.extract_field(soup, 'Groupement de commandes')
+        data['allows_consortia'] = consortia_str == 'Oui' if consortia_str else None
+        
+        variants_str = self.extract_field(soup, 'L\'acheteur exige la présentations de variantes')
+        data['allows_variants'] = variants_str == 'Oui' if variants_str else None
+        
+        visit_str = self.extract_field(soup, 'Visite obligatoire')
+        data['requires_site_visit'] = visit_str == 'Oui' if visit_str else None
+        
+        reserved_str = self.extract_field(soup, 'réservation')
+        data['reserved_contract'] = reserved_str == 'Oui' if reserved_str else None
+        
+        # ==================== EXECUTION DETAILS ====================
+        data['execution_location'] = self.extract_field(soup, 'Lieu principal d\'exécution')
+        
+        # ==================== URLS ====================
+        portal_url = self.extract_field(soup, 'Autre moyen d\'accès')
+        if portal_url and 'http' in portal_url:
+            data['external_portal_url'] = portal_url
+        
+        data['detail_url'] = f"https://www.boamp.fr/avis/detail/{data['idweb']}"
         
         # ==================== LOCATION ====================
-        # Department - multiple strategies
-        department = None
         dept = soup.find(text=re.compile(r'Département', re.IGNORECASE))
         if dept:
             dept_num = dept.find_next('strong')
-            if dept_num:
-                department = dept_num.text.strip()
-        if not department:
-            # Look for 2-digit department codes
-            dept_match = re.search(r'Département[^:]*:\s*(\d{2,3})', html, re.IGNORECASE)
-            if dept_match:
-                department = dept_match.group(1)
-        if not department:
-            # Extract from postal code if available
-            postal = self.extract_field(soup, 'Code postal')
-            if postal and len(postal) >= 2:
-                department = postal[:2]
-        data['department'] = department
+            data['department'] = dept_num.text.strip() if dept_num else None
+        
+        if not data['department'] and data.get('buyer_postcode'):
+            data['department'] = data['buyer_postcode'][:2]
+        
+        # ==================== ADDITIONAL INFO ====================
+        data['additional_info'] = self.extract_field(soup, 'Autres informations complémentaires')
+        
+        # ==================== AWARD INFORMATION (for attribution notices) ====================
+        if data.get('notice_type') and ('attribution' in data['notice_type'].lower() or 'résultat' in data['notice_type'].lower()):
+            logger.info(f"   Extracting award data for {data['idweb']}")
+            
+            # Method 1: USE CLAUDE API (if enabled) - highest accuracy
+            if self.use_claude_for_awards and not data.get('winner_name'):
+                claude_data = self.extract_award_with_claude(html, data['idweb'])
+                if claude_data and claude_data.get('winner_name'):
+                    data['winner_name'] = claude_data.get('winner_name')
+                    data['winner_city'] = claude_data.get('winner_city')
+                    data['winner_postal_code'] = claude_data.get('winner_postal_code')
+                    data['winner_address'] = claude_data.get('winner_address')
+                    data['winner_country'] = claude_data.get('winner_country') or 'France'
+                    data['winner_email'] = claude_data.get('winner_email')
+                    data['winner_phone'] = claude_data.get('winner_phone')
+                    
+                    if claude_data.get('award_value'):
+                        data['estimated_value'] = float(claude_data['award_value'])
+                    
+                    if claude_data.get('award_date'):
+                        try:
+                            data['contract_start_date'] = datetime.strptime(claude_data['award_date'], '%Y-%m-%d')
+                        except:
+                            pass
+                    
+                    logger.info(f"   ✅ Winner (Claude): {data['winner_name']}")
+                    if data.get('estimated_value'):
+                        logger.info(f"   ✅ Award value: €{data['estimated_value']:,.0f}")
+            
+            # Method 2: Regex fallback - Try Section 8 + Section 5 format
+            if not data.get('winner_name'):
+                organizations = self.extract_organizations_section8(soup)
+                winning_org_ids = self.extract_winner_from_section5(soup)
+                
+                if winning_org_ids and organizations:
+                    winner_org_id = winning_org_ids[0]
+                    if winner_org_id in organizations:
+                        winner = organizations[winner_org_id]
+                        data['winner_name'] = winner.get('name')
+                        data['winner_city'] = winner.get('city')
+                        data['winner_postal_code'] = winner.get('postal_code')
+                        data['winner_country'] = winner.get('country')
+                        data['winner_email'] = winner.get('email')
+                        data['winner_phone'] = winner.get('phone')
+                        logger.info(f"   ✅ Winner (Regex-Sec8): {data['winner_name']}")
+            
+            # Method 3: Regex fallback - Try Section 4 plain text
+            if not data.get('winner_name'):
+                resultat_data = self.extract_resultat_section4(soup, html)
+                if resultat_data and resultat_data.get('winner_name'):
+                    data['winner_name'] = resultat_data.get('winner_name')
+                    data['winner_city'] = resultat_data.get('winner_city')
+                    data['winner_postal_code'] = resultat_data.get('winner_postal_code')
+                    data['winner_address'] = resultat_data.get('winner_address')
+                    
+                    if resultat_data.get('award_value'):
+                        data['estimated_value'] = resultat_data.get('award_value')
+                    
+                    if resultat_data.get('award_date'):
+                        data['contract_start_date'] = resultat_data.get('award_date')
+                    
+                    logger.info(f"   ✅ Winner (Regex-Sec4): {data['winner_name']}")
+            
+            # Extract award value if still missing
+            if not data.get('estimated_value'):
+                award_values = self.extract_award_value(soup, html)
+                if award_values:
+                    data['estimated_value'] = self.parse_amount(award_values[0])
+                    logger.info(f"   ✅ Award value (Sec5): {data['estimated_value']}")
+            
+            # Fallback: Extract award date if not found
+            if not data.get('contract_start_date'):
+                award_date = self.extract_award_date(soup)
+                if award_date:
+                    data['contract_start_date'] = award_date
+                    logger.info(f"   ✅ Award date: {award_date}")
         
         return data
     
     def save_to_db(self, tenders):
-        """Save parsed tenders to staging table with population stats"""
+        """Save comprehensive tender data"""
         if not tenders:
             return 0
             
         cursor = self.db_conn.cursor()
         
-        # Calculate field population statistics
-        field_stats = {}
+        # Calculate field population
         critical_fields = [
-            'title', 'notice_number', 'notice_type', 'buyer_name', 
-            'tender_title', 'description', 'cpv_codes', 'department'
+            'title', 'notice_number', 'buyer_name', 'tender_title', 
+            'cpv_codes', 'deadline', 'department', 'contact_email'
         ]
         
+        field_stats = {}
         for field in critical_fields:
             populated = sum(1 for t in tenders if t.get(field))
             field_stats[field] = (populated / len(tenders)) * 100
@@ -460,43 +811,35 @@ class BOAMPDailyScraper:
         try:
             values = [
                 (
-                    t['idweb'],
-                    t.get('title'),
-                    t.get('notice_number'),
-                    t.get('notice_type'),
-                    t.get('buyer_name'),
-                    t.get('buyer_type'),
-                    t.get('buyer_activity'),
-                    t.get('tender_title'),
-                    t.get('description'),
-                    t.get('procedure_id'),
-                    t.get('internal_id'),
-                    t.get('procedure_type'),
-                    t.get('cpv_codes'),
-                    t.get('department'),
-                    t.get('estimated_value'),
-                    t.get('contract_amounts'),
-                    t.get('winner_name'),
-                    t.get('winner_email'),
-                    t.get('winner_phone'),
-                    t.get('winner_city'),
-                    t.get('winner_postal_code'),
-                    t.get('winner_country'),
-                    t.get('winner_size'),
-                    t.get('published_date'),
-                    t.get('html_content'),
+                    t['idweb'], t.get('source_id'), t.get('internal_ref'), t.get('notice_number'),
+                    t.get('notice_type'), t.get('title'), t.get('tender_title'), t.get('short_description'),
+                    t.get('full_description'), t.get('buyer_name'), t.get('buyer_city'), t.get('buyer_postcode'),
+                    t.get('buyer_siret'), t.get('buyer_organization_type'), t.get('buyer_sector'),
+                    t.get('contact_name'), t.get('contact_email'), t.get('contact_phone'),
+                    t.get('cpv_codes'), t.get('cpv_primary'), t.get('department'),
+                    t.get('published_at'), t.get('deadline'), t.get('estimated_value'),
+                    t.get('contract_amounts'), t.get('contract_duration_months'), t.get('contract_type'),
+                    t.get('procurement_method'), t.get('procedure_type'), t.get('has_lots'),
+                    t.get('number_of_lots'), t.get('lot_structure'), t.get('has_tranches'),
+                    t.get('allows_consortia'), t.get('allows_variants'), t.get('requires_site_visit'),
+                    t.get('reserved_contract'), t.get('execution_location'), t.get('detail_url'),
+                    t.get('external_portal_url'), t.get('additional_info'), t.get('html_content'),
                     t.get('scraped_at')
-                ) 
+                )
                 for t in tenders
             ]
             
             execute_values(cursor, """
-                INSERT INTO france_boamp_daily_staging 
-                (idweb, title, notice_number, notice_type, buyer_name, buyer_type, 
-                 buyer_activity, tender_title, description, procedure_id, internal_id, 
-                 procedure_type, cpv_codes, department, estimated_value, contract_amounts,
-                 winner_name, winner_email, winner_phone, winner_city, winner_postal_code,
-                 winner_country, winner_size, published_date, html_content, scraped_at)
+                INSERT INTO france_boamp_comprehensive 
+                (idweb, source_id, internal_ref, notice_number, notice_type, title, tender_title,
+                 short_description, full_description, buyer_name, buyer_city, buyer_postcode,
+                 buyer_siret, buyer_organization_type, buyer_sector, contact_name, contact_email,
+                 contact_phone, cpv_codes, cpv_primary, department, published_at, deadline,
+                 estimated_value, contract_amounts, contract_duration_months, contract_type,
+                 procurement_method, procedure_type, has_lots, number_of_lots, lot_structure,
+                 has_tranches, allows_consortia, allows_variants, requires_site_visit,
+                 reserved_contract, execution_location, detail_url, external_portal_url,
+                 additional_info, html_content, scraped_at)
                 VALUES %s
                 ON CONFLICT (idweb) DO NOTHING
             """, values)
@@ -505,14 +848,8 @@ class BOAMPDailyScraper:
             self.db_conn.commit()
             
             logger.info(f"💾 Saved {saved_count} new tenders (skipped {len(tenders) - saved_count} duplicates)")
-            logger.info(f"📊 Field Population Rate: {avg_population:.1f}%")
+            logger.info(f"📊 Critical Field Population: {avg_population:.1f}%")
             
-            # Log any fields below 80%
-            low_fields = [f for f, rate in field_stats.items() if rate < 80]
-            if low_fields:
-                logger.warning(f"⚠️  Fields below 80%: {', '.join(low_fields)}")
-            
-            # Log detailed stats
             for field, rate in sorted(field_stats.items(), key=lambda x: x[1]):
                 logger.info(f"   {field}: {rate:.1f}%")
             
@@ -520,16 +857,16 @@ class BOAMPDailyScraper:
             
         except Exception as e:
             logger.error(f"❌ Error saving to database: {e}")
+            logger.error(f"First tender data: {tenders[0] if tenders else 'None'}")
             self.db_conn.rollback()
             return 0
     
     def run_daily(self, hours_back=24, max_records=1000, batch_size=100):
-        """Run daily scrape for recent tenders"""
+        """Run comprehensive daily scrape"""
         logger.info("="*70)
-        logger.info(f"🇫🇷 Starting BOAMP Daily Scraper - Last {hours_back} hours")
+        logger.info(f"🇫🇷 BOAMP Comprehensive Scraper - Last {hours_back} hours")
         logger.info("="*70)
         
-        # Create/verify table
         self.create_staging_table()
         
         offset = 0
@@ -547,7 +884,6 @@ class BOAMPDailyScraper:
                 logger.info("✅ No more tenders to process")
                 break
             
-            # Parse all tenders
             parsed = []
             for tender in raw_tenders:
                 try:
@@ -557,7 +893,6 @@ class BOAMPDailyScraper:
                     logger.error(f"❌ Error parsing tender {tender.get('idweb')}: {e}")
                     continue
             
-            # Save batch
             saved_count = self.save_to_db(parsed)
             
             total_processed += len(parsed)
@@ -569,22 +904,19 @@ class BOAMPDailyScraper:
                 logger.info(f"✅ Processed all available records ({total_available})")
                 break
             
-            # Rate limiting
             time.sleep(1)
         
         logger.info("="*70)
-        logger.info(f"🎉 Daily scrape complete!")
+        logger.info(f"🎉 Comprehensive scrape complete!")
         logger.info(f"📊 Total processed: {total_processed}")
         logger.info(f"💾 New records saved: {total_saved}")
-        logger.info(f"🔄 Duplicates skipped: {total_processed - total_saved}")
         logger.info("="*70)
         
         self.cleanup()
         
         return {
             'processed': total_processed,
-            'saved': total_saved,
-            'duplicates': total_processed - total_saved
+            'saved': total_saved
         }
     
     def cleanup(self):
@@ -593,9 +925,9 @@ class BOAMPDailyScraper:
             logger.info("🔒 Database connection closed")
 
 if __name__ == "__main__":
-    scraper = BOAMPDailyScraper()
+    scraper = BOAMPComprehensiveScraper()
     scraper.run_daily(
-        hours_back=24,  # Last 24 hours
-        max_records=1000,  # Safety limit
+        hours_back=24,
+        max_records=1000,
         batch_size=100
     )

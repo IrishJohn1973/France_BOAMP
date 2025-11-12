@@ -824,8 +824,7 @@ JSON only:"""
                     t.get('allows_consortia'), t.get('allows_variants'), t.get('requires_site_visit'),
                     t.get('reserved_contract'), t.get('execution_location'), t.get('detail_url'),
                     t.get('external_portal_url'), t.get('additional_info'), t.get('html_content'),
-                    t.get('winner_name'), t.get('winner_city'), t.get('winner_postal_code'),
-                    t.get('winner_country'), t.get('winner_email'), t.get('winner_phone'), t.get('contract_start_date'), t.get('scraped_at')
+                    t.get('scraped_at')
                 )
                 for t in tenders
             ]
@@ -840,8 +839,7 @@ JSON only:"""
                  procurement_method, procedure_type, has_lots, number_of_lots, lot_structure,
                  has_tranches, allows_consortia, allows_variants, requires_site_visit,
                  reserved_contract, execution_location, detail_url, external_portal_url,
-                 additional_info, html_content, winner_name, winner_city, winner_postal_code,
-                 winner_country, winner_email, winner_phone, contract_start_date, scraped_at)
+                 additional_info, html_content, scraped_at)
                 VALUES %s
                 ON CONFLICT (idweb) DO NOTHING
             """, values)

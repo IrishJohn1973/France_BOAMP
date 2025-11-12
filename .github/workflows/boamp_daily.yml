@@ -1,0 +1,36 @@
+name: BOAMP Daily Scraper
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC (3 AM Paris time during winter, 4 AM during summer)
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install requests beautifulsoup4 lxml psycopg2-binary
+    
+    - name: Run BOAMP scraper
+      env:
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      run: |
+        python boamp_daily_scraper.py
+      
+    - name: Notify on failure
+      if: failure()
+      run: |
+        echo "❌ BOAMP scraper failed"
+        # Add notification logic here (email, Slack, etc.)

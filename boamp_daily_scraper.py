@@ -543,7 +543,7 @@ JSON only:"""
             dept_num = dept.find_next('strong')
             data['department'] = dept_num.text.strip() if dept_num else None
 
-        if not data['department'] and data.get('buyer_postcode'):
+        if not data.get("department") and data.get('buyer_postcode'):
             data['department'] = data['buyer_postcode'][:2]
 
         data['additional_info'] = self.extract_field(soup, 'Autres informations complementaires')

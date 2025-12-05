@@ -1,24 +1,18 @@
- #!/usr/bin/env python3
+ BOAMP Daily Award Scraper - FIXED VERSION
+  ==========================================
+  Fix: Correctly distinguishes government BUYERS from company WINNERS
+  ...
   """
+
+  import os
+  import re
+
+> GIVE ME THE FULL WORKING FIT 
+
+⏺ """
   BOAMP Daily Award Scraper - FIXED VERSION
   ==========================================
   Fix: Correctly distinguishes government BUYERS from company WINNERS
-
-  Root Cause of Original Bug:
-  - Government entities (Mairie, Commune, Ville, Région, Département) were
-   being
-    placed in winner_name instead of buyer_name
-  - The Claude prompt didn't specify that government entities are BUYERS
-  - The regex fallback grabbed the first entity after contract number 
-  regardless
-    of whether it was a buyer or winner
-
-  Changes Made:
-  1. Added GOVERNMENT_ENTITY_PATTERNS to detect public bodies
-  2. Updated Claude prompt with explicit buyer/winner distinction
-  3. Added validate_winner_not_government() function
-  4. Fixed extract_resultat_section4() to check entity type
-  5. Added swap logic when buyer/winner are confused
   """
 
   import os
@@ -29,46 +23,33 @@
   import hashlib
   from datetime import datetime, timedelta
   from typing import Optional, Dict, Any, List, Tuple
-  from dataclasses import dataclass, asdict
+  from dataclasses import dataclass
   from bs4 import BeautifulSoup
   import requests
   from anthropic import Anthropic
   from supabase import create_client, Client
 
-  # Configure logging
   logging.basicConfig(
       level=logging.INFO,
       format='%(asctime)s - %(levelname)s - %(message)s'
   )
   logger = logging.getLogger(__name__)
 
-  # ======================================================================
-  =======
-  # GOVERNMENT ENTITY PATTERNS - Key fix for buyer/winner confusion
-  # ======================================================================
-  =======
   GOVERNMENT_ENTITY_PATTERNS = [
-      # French municipalities and local government
       r'^mairie\b',
       r'^commune\b',
       r'^ville\b',
       r'^communauté\b',
       r'^métropole\b',
       r'^agglomération\b',
-
-      # Regional and departmental
       r'^région\b',
       r'^département\b',
       r'^conseil\s+(régional|départemental|général|municipal)',
-
-      # Ministries and state bodies
       r'^ministère\b',
       r'^préfecture\b',
       r'^sous-préfecture\b',
       r'^direction\s+(régionale|départementale|générale)',
       r'^service\s+(départemental|régional)',
-
-      # Public establishments
       r'^établissement\s+public',
       r'^centre\s+hospitalier',
       r'^hôpital\b',
@@ -77,36 +58,29 @@
       r'^centre\s+communal',
       r'^ccas\b',
       r'^cias\b',
-
-      # Educational institutions (public)
       r'^université\b',
       r'^lycée\b',
       r'^collège\b',
       r'^école\b',
       r'^académie\b',
       r'^rectorat\b',
-
-      # Social housing and public bodies
       r'^office\s+(public|hlm)',
       r'^opac\b',
       r'^oph\b',
-      r'^sdis\b',  # Fire services
+      r'^sdis\b',
       r'^syndicat\b',
       r'^sivom\b',
       r'^sivu\b',
       r'^siaep\b',
-
-      # Other public entities
       r'^caisse\b',
       r'^chambre\s+(de\s+commerce|des\s+métiers|d\'agriculture)',
       r'^port\s+(autonome|de)',
       r'^aéroport\b',
       r'^régie\b',
-      r'^sem\b',  # Société d'économie mixte
-      r'^epl\b',  # Entreprise publique locale
+      r'^sem\b',
+      r'^epl\b',
   ]
 
-  # Compile patterns for efficiency
   GOVERNMENT_PATTERNS_COMPILED = [
       re.compile(pattern, re.IGNORECASE) for pattern in
   GOVERNMENT_ENTITY_PATTERNS
@@ -114,20 +88,12 @@
 
 
   def is_government_entity(name: str) -> bool:
-      """
-      Check if a name matches known government entity patterns.
-      Returns True if the name appears to be a government/public body.
-      """
       if not name:
           return False
-
       name_clean = name.strip().lower()
-
       for pattern in GOVERNMENT_PATTERNS_COMPILED:
           if pattern.search(name_clean):
               return True
-
-      # Additional keyword checks
       gov_keywords = [
           'mairie', 'commune', 'ville', 'région', 'département',
           'préfecture', 'ministère', 'conseil', 'hôpital', 'centre 
@@ -135,57 +101,33 @@
           'université', 'lycée', 'collège', 'école', 'syndicat',
           'office public', 'établissement public', 'service public'
       ]
-
       for keyword in gov_keywords:
           if keyword in name_clean:
               return True
-
       return False
 
 
   def validate_and_swap_if_needed(buyer_name: str, winner_name: str) -> 
   Tuple[str, str]:
-      """
-      Validate buyer/winner assignment and swap if they appear to be 
-  confused.
-
-      Logic:
-      - If winner_name looks like a government entity → it should be buyer
-      - If buyer_name looks like a company → it might be winner
-      """
       buyer_is_gov = is_government_entity(buyer_name) if buyer_name else
   False
       winner_is_gov = is_government_entity(winner_name) if winner_name
   else False
-
-      # Case 1: Winner is government, buyer is empty → swap
       if winner_is_gov and not buyer_name:
           logger.info(f"SWAP: Moving government entity '{winner_name}' 
   from winner to buyer")
           return winner_name, None
-
-      # Case 2: Winner is government, buyer is NOT government → swap
       if winner_is_gov and buyer_name and not buyer_is_gov:
           logger.info(f"SWAP: Winner '{winner_name}' is gov, buyer 
-  '{buyer_name}' is company → swapping")
+  '{buyer_name}' is company -> swapping")
           return winner_name, buyer_name
-
-      # Case 3: Both look like government → winner is probably wrong
       if winner_is_gov and buyer_is_gov:
           logger.warning(f"BOTH appear to be government: 
   buyer='{buyer_name}', winner='{winner_name}'")
-          # Keep buyer, clear winner (needs manual review)
           return buyer_name, None
-
-      # No swap needed
       return buyer_name, winner_name
 
 
-  # ======================================================================
-  =======
-  # Configuration
-  # ======================================================================
-  =======
   @dataclass
   class Config:
       supabase_url: str
@@ -198,7 +140,6 @@
 
 
   def load_config() -> Config:
-      """Load configuration from environment variables."""
       return Config(
           supabase_url=os.environ.get('SUPABASE_URL', ''),
           supabase_key=os.environ.get('SUPABASE_SERVICE_ROLE_KEY', ''),
@@ -206,11 +147,6 @@
       )
 
 
-  # ======================================================================
-  =======
-  # Data Models
-  # ======================================================================
-  =======
   @dataclass
   class AwardData:
       native_id: str
@@ -235,11 +171,6 @@
       content_hash: Optional[str] = None
 
 
-  # ======================================================================
-  =======
-  # BOAMP Scraper Class
-  # ======================================================================
-  =======
   class BOAMPDailyScraper:
       def __init__(self, config: Config):
           self.config = config
@@ -250,22 +181,19 @@
   'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
               'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
           })
-
           self.supabase: Client = create_client(config.supabase_url,
   config.supabase_key)
           self.anthropic = Anthropic(api_key=config.anthropic_key)
-
           self.stats = {
               'fetched': 0,
               'parsed': 0,
               'saved': 0,
               'errors': 0,
               'skipped': 0,
-              'swapped': 0,  # Track buyer/winner swaps
+              'swapped': 0,
           }
 
       def fetch_page(self, url: str) -> Optional[str]:
-          """Fetch a page with retry logic."""
           for attempt in range(self.config.max_retries):
               try:
                   response = self.session.get(url, timeout=30)
@@ -279,7 +207,6 @@
           return None
 
       def get_search_url(self, date: datetime) -> str:
-          """Build search URL for award notices on a specific date."""
           date_str = date.strftime('%Y-%m-%d')
           return (
               f"{self.config.base_url}/avis/liste?"
@@ -290,11 +217,8 @@
           )
 
       def extract_notice_links(self, html: str) -> List[str]:
-          """Extract award notice links from search results page."""
           soup = BeautifulSoup(html, 'html.parser')
           links = []
-
-          # Find all notice links
           for link in soup.select('a[href*="/avis/detail/"]'):
               href = link.get('href', '')
               if href and '/avis/detail/' in href:
@@ -302,52 +226,33 @@
   f"{self.config.base_url}{href}"
                   if full_url not in links:
                       links.append(full_url)
-
           return links
 
       def extract_native_id(self, url: str) -> Optional[str]:
-          """Extract the native ID from a BOAMP URL."""
           match = re.search(r'/avis/detail/(\d+-\d+)', url)
           return match.group(1) if match else None
 
       def compute_content_hash(self, html: str) -> str:
-          """Compute hash of content for deduplication."""
           return hashlib.md5(html.encode('utf-8')).hexdigest()
 
-      # ==================================================================
-  =======
-      # FIXED: Claude extraction with proper buyer/winner distinction
-      # ==================================================================
-  =======
       def extract_award_with_claude(self, html: str, url: str) -> 
   Optional[Dict]:
-          """
-          Use Claude to extract structured award data from HTML.
-          FIXED: Prompt now explicitly distinguishes government BUYERS 
-  from company WINNERS.
-          """
           soup = BeautifulSoup(html, 'html.parser')
-
-          # Remove scripts and styles
           for tag in soup(['script', 'style', 'nav', 'footer', 'header']):
               tag.decompose()
-
           text = soup.get_text(separator='\n', strip=True)
-          # Limit text length for Claude
           text = text[:15000]
 
-          # FIXED PROMPT: Explicitly identifies government entities as 
-  BUYERS
           prompt = f"""Extract structured data from this French public 
   procurement award notice (BOAMP).
 
   CRITICAL DISTINCTION - READ CAREFULLY:
   - BUYER (Acheteur/Pouvoir adjudicateur): The GOVERNMENT entity awarding 
   the contract.
-    These are ALWAYS public bodies like: Mairie, Commune, Ville, Région, 
-  Département,
-    Conseil, Ministère, Préfecture, Centre Hospitalier, Université, Lycée,
-   Collège,
+    These are ALWAYS public bodies like: Mairie, Commune, Ville, Region, 
+  Departement,
+    Conseil, Ministere, Prefecture, Centre Hospitalier, Universite, Lycee,
+   College,
     Office Public, Syndicat, SDIS, etc.
 
   - WINNER (Titulaire/Attributaire): The PRIVATE COMPANY that won the 
@@ -362,7 +267,7 @@
 
   Return ONLY valid JSON with these fields (use null if not found):
   {{
-      "buyer_name": "Government entity name (Mairie, Commune, Département,
+      "buyer_name": "Government entity name (Mairie, Commune, Departement,
    etc.)",
       "buyer_address": "Buyer street address",
       "buyer_city": "Buyer city",
@@ -376,11 +281,11 @@
   }}
 
   IMPORTANT VALIDATION:
-  - If winner_name contains "Mairie", "Commune", "Ville", "Région", 
-  "Département",
-    "Conseil", "Ministère", "Hôpital", "Université", "Lycée", "École", 
+  - If winner_name contains "Mairie", "Commune", "Ville", "Region", 
+  "Departement",
+    "Conseil", "Ministere", "Hopital", "Universite", "Lycee", "Ecole", 
   "Syndicat",
-    "Office", "Centre hospitalier", "Préfecture" - you have made an error!
+    "Office", "Centre hospitalier", "Prefecture" - you have made an error!
     That is the BUYER, not the winner.
 
   Text to analyze:
@@ -392,85 +297,54 @@
                   max_tokens=1024,
                   messages=[{"role": "user", "content": prompt}]
               )
-
               result_text = response.content[0].text.strip()
-
-              # Extract JSON from response
               json_match = re.search(r'\{[\s\S]*\}', result_text)
               if json_match:
                   data = json.loads(json_match.group())
-
-                  # VALIDATION: Check if winner looks like a government 
-  entity
                   winner = data.get('winner_name')
                   buyer = data.get('buyer_name')
-
                   if winner and is_government_entity(winner):
                       logger.warning(f"Claude returned government entity 
   as winner: {winner}")
-                      # Attempt to swap
                       new_buyer, new_winner =
   validate_and_swap_if_needed(buyer, winner)
                       data['buyer_name'] = new_buyer
                       data['winner_name'] = new_winner
                       self.stats['swapped'] += 1
-
                   return data
-
           except json.JSONDecodeError as e:
               logger.error(f"JSON parse error: {e}")
           except Exception as e:
               logger.error(f"Claude extraction error: {e}")
-
           return None
 
-      # ==================================================================
-  =======
-      # FIXED: Regex fallback with government entity detection
-      # ==================================================================
-  =======
       def extract_resultat_section4(self, soup: BeautifulSoup, html: str) 
   -> Dict:
-          """
-          Extract winner data from Section 4 (Résultat) using regex 
-  patterns.
-          FIXED: Now validates extracted names to prevent government 
-  entities as winners.
-          """
           winner_data = {
               'winner_name': None,
               'winner_address': None,
               'winner_city': None,
               'award_value': None,
           }
-
-          # Find Section 4 content
           section_4 =
-  soup.find(string=re.compile(r'SECTION\s*4|RÉSULTAT|ATTRIBUTION', re.I))
+  soup.find(string=re.compile(r'SECTION\s*4|RESULTAT|ATTRIBUTION', re.I))
           if not section_4:
               return winner_data
-
           section_4_container = section_4.find_parent(['div', 'section'])
           if not section_4_container:
               return winner_data
-
           section_4_text = section_4_container.get_text(separator='\n',
   strip=True)
 
-          # Pattern 1: Look for "Titulaire" or "Attributaire" section
           titulaire_match = re.search(
               r'(?:Titulaire|Attributaire)[:\s]*\n?\s*([^\n]+)',
               section_4_text,
               re.IGNORECASE
           )
-
           if titulaire_match:
               potential_winner = titulaire_match.group(1).strip()
-              # Clean up the name
-              potential_winner = re.sub(r'^(La société|L\'entreprise|La 
+              potential_winner = re.sub(r'^(La societe|L\'entreprise|La 
   SARL|La SAS)\s+', '', potential_winner, flags=re.I)
-
-              # VALIDATION: Check it's not a government entity
               if potential_winner and not
   is_government_entity(potential_winner):
                   winner_data['winner_name'] = potential_winner
@@ -478,25 +352,18 @@
                   logger.warning(f"Rejected government entity from 
   titulaire: {potential_winner}")
 
-          # Pattern 2: Look for line after "Marché n° :" (careful - this 
-  often has buyer!)
           if not winner_data['winner_name']:
               marche_match = re.search(
-                  r'Marché n°\s*:\s*[\d\.]+\s*\n\s*([^\n]+)',
+                  r'Marche n\s*:\s*[\d\.]+\s*\n\s*([^\n]+)',
                   section_4_text
               )
               if marche_match:
                   winner_line = marche_match.group(1).strip()
                   parts = [p.strip() for p in winner_line.split(',')]
-
-                  # Find the first part that's NOT a government entity
                   for part in parts:
                       if part and not is_government_entity(part):
                           winner_data['winner_name'] = part
                           break
-
-                  # Try to extract city (usually last part with postal 
-  code pattern)
                   for part in reversed(parts):
                       if re.search(r'\d{5}', part):
                           city = re.sub(r'^\d{5}\s*', '', part).strip(' 
@@ -505,15 +372,13 @@
                               winner_data['winner_city'] = city
                           break
 
-          # Extract award value
           value_patterns = [
               r'Montant\s*(?:HT|TTC)?\s*[:\s]*\s*([\d\s]+(?:[,\.]\d+)?)\s*
-  (?:€|EUR|euros?)',
+  (?:EUR|euros?)',
               r'Valeur\s*(?:totale)?\s*[:\s]*\s*([\d\s]+(?:[,\.]\d+)?)\s*(
-  ?:€|EUR|euros?)',
-              r'([\d\s]+(?:[,\.]\d+)?)\s*(?:€|EUR|euros?)\s*(?:HT|TTC)?',
+  ?:EUR|euros?)',
+              r'([\d\s]+(?:[,\.]\d+)?)\s*(?:EUR|euros?)\s*(?:HT|TTC)?',
           ]
-
           for pattern in value_patterns:
               value_match = re.search(pattern, section_4_text, re.I)
               if value_match:
@@ -524,50 +389,37 @@
                       break
                   except ValueError:
                       pass
-
           return winner_data
 
       def extract_buyer_section1(self, soup: BeautifulSoup) -> Dict:
-          """
-          Extract buyer data from Section 1 (Identification de 
-  l'acheteur).
-          Buyer should ALWAYS be a government entity.
-          """
           buyer_data = {
               'buyer_name': None,
               'buyer_address': None,
               'buyer_city': None,
           }
-
-          # Find Section 1 content
           section_1 =
   soup.find(string=re.compile(r'SECTION\s*1|IDENTIFICATION|ACHETEUR',
   re.I))
           if not section_1:
               return buyer_data
-
           section_1_container = section_1.find_parent(['div', 'section'])
           if not section_1_container:
               return buyer_data
-
           section_1_text = section_1_container.get_text(separator='\n',
   strip=True)
 
-          # Extract buyer name
           name_patterns = [
 
   r'(?:Nom\s+(?:officiel|de\s+l\'acheteur)?)[:\s]*\n?\s*([^\n]+)',
               r'(?:Pouvoir\s+adjudicateur)[:\s]*\n?\s*([^\n]+)',
               r'(?:Acheteur)[:\s]*\n?\s*([^\n]+)',
           ]
-
           for pattern in name_patterns:
               match = re.search(pattern, section_1_text, re.I)
               if match:
                   buyer_data['buyer_name'] = match.group(1).strip()
                   break
 
-          # Extract address
           address_match = re.search(
               r'(?:Adresse\s*(?:postale)?)[:\s]*\n?\s*([^\n]+)',
               section_1_text,
@@ -576,25 +428,17 @@
           if address_match:
               buyer_data['buyer_address'] = address_match.group(1).strip()
 
-          # Extract city (look for postal code pattern)
-          city_match = re.search(r'(\d{5})\s*([A-ZÀ-Ý][a-zà-ÿ\-\s]+)',
+          city_match = re.search(r'(\d{5})\s*([A-Za-z][a-z\-\s]+)',
   section_1_text)
           if city_match:
               buyer_data['buyer_city'] = city_match.group(2).strip()
-
           return buyer_data
 
       def extract_cpv_codes(self, soup: BeautifulSoup) -> List[str]:
-          """Extract CPV codes from the notice."""
           cpv_codes = []
-
-          # Look for CPV patterns
           text = soup.get_text()
           cpv_matches = re.findall(r'\b(\d{8}(?:-\d)?)\b', text)
-
           for code in cpv_matches:
-              # Validate it looks like a CPV code (starts with valid 
-  prefix)
               if code[:2] in ['03', '09', '14', '15', '16', '18', '19',
   '22', '24',
                              '30', '31', '32', '33', '34', '35', '37',
@@ -607,57 +451,42 @@
   '98']:
                   if code not in cpv_codes:
                       cpv_codes.append(code)
-
-          return cpv_codes[:10]  # Limit to 10 codes
+          return cpv_codes[:10]
 
       def extract_title(self, soup: BeautifulSoup) -> Optional[str]:
-          """Extract the notice title."""
-          # Try various title selectors
           title_selectors = [
               'h1.notice-title',
               'h1',
               '.titre-avis',
               '[class*="title"]',
           ]
-
           for selector in title_selectors:
               element = soup.select_one(selector)
               if element:
                   title = element.get_text(strip=True)
                   if title and len(title) > 10:
                       return title[:500]
-
           return None
 
       def parse_award_notice(self, html: str, url: str) -> 
   Optional[AwardData]:
-          """
-          Parse a single award notice page.
-          FIXED: Now validates and swaps buyer/winner if confused.
-          """
           soup = BeautifulSoup(html, 'html.parser')
           native_id = self.extract_native_id(url)
-
           if not native_id:
               logger.warning(f"Could not extract native ID from {url}")
               return None
 
-          # Try Claude extraction first
           claude_data = self.extract_award_with_claude(html, url)
-
-          # Fallback to regex extraction
           buyer_data = self.extract_buyer_section1(soup)
           winner_data = self.extract_resultat_section4(soup, html)
           cpv_codes = self.extract_cpv_codes(soup)
           title = self.extract_title(soup)
 
-          # Merge data with Claude taking precedence
           final_buyer_name = (claude_data or {}).get('buyer_name') or
   buyer_data.get('buyer_name')
           final_winner_name = (claude_data or {}).get('winner_name') or
   winner_data.get('winner_name')
 
-          # FINAL VALIDATION: Swap if needed
           final_buyer_name, final_winner_name =
   validate_and_swap_if_needed(
               final_buyer_name, final_winner_name
@@ -690,11 +519,9 @@
   {}).get('short_description'),
               content_hash=self.compute_content_hash(html),
           )
-
           return award
 
       def save_award(self, award: AwardData) -> bool:
-          """Save award to database."""
           try:
               data = {
                   'native_id': award.native_id,
@@ -717,66 +544,48 @@
                   'short_description': award.short_description,
                   'content_hash': award.content_hash,
               }
-
-              # Upsert to database
               self.supabase.table('france_boamp_daily_normalized').upsert(
                   data,
                   on_conflict='native_id'
               ).execute()
-
               return True
-
           except Exception as e:
               logger.error(f"Failed to save award {award.native_id}: {e}")
               return False
 
       def scrape_date(self, date: datetime) -> int:
-          """Scrape all award notices for a specific date."""
           logger.info(f"Scraping awards for {date.strftime('%Y-%m-%d')}")
-
-          # Get search results page
           search_url = self.get_search_url(date)
           html = self.fetch_page(search_url)
-
           if not html:
               logger.error(f"Failed to fetch search page for {date}")
               return 0
 
-          # Extract notice links
           notice_links = self.extract_notice_links(html)
           logger.info(f"Found {len(notice_links)} award notices")
-
           saved_count = 0
 
           for i, url in enumerate(notice_links):
               try:
-                  # Respect rate limiting
                   time.sleep(self.config.request_delay)
-
-                  # Fetch notice page
                   notice_html = self.fetch_page(url)
                   if not notice_html:
                       self.stats['errors'] += 1
                       continue
-
                   self.stats['fetched'] += 1
 
-                  # Parse award data
                   award = self.parse_award_notice(notice_html, url)
                   if not award:
                       self.stats['errors'] += 1
                       continue
-
                   self.stats['parsed'] += 1
 
-                  # Validate we have meaningful data
                   if not award.winner_name and not award.buyer_name:
                       logger.warning(f"Skipping {url}: No buyer or winner 
   extracted")
                       self.stats['skipped'] += 1
                       continue
 
-                  # Save to database
                   if self.save_award(award):
                       saved_count += 1
                       self.stats['saved'] += 1
@@ -785,35 +594,29 @@
   {award.winner_name}")
                   else:
                       self.stats['errors'] += 1
-
               except Exception as e:
                   logger.error(f"Error processing {url}: {e}")
                   self.stats['errors'] += 1
-
           return saved_count
 
       def scrape_date_range(self, start_date: datetime, end_date: 
   datetime) -> Dict:
-          """Scrape awards for a range of dates."""
           current_date = start_date
           total_saved = 0
-
           while current_date <= end_date:
               saved = self.scrape_date(current_date)
               total_saved += saved
               current_date += timedelta(days=1)
-
           return {
               'total_saved': total_saved,
               'stats': self.stats,
           }
 
       def print_stats(self):
-          """Print scraping statistics."""
           logger.info("=" * 50)
           logger.info("SCRAPING STATISTICS")
           logger.info("=" * 50)
-          logger.info(f"Pages fetched:    {self.stats['fetched']}")
+          logger.info(f"Pages fetched:       {self.stats['fetched']}")
           logger.info(f"Successfully parsed: {self.stats['parsed']}")
           logger.info(f"Saved to database:   {self.stats['saved']}")
           logger.info(f"Buyer/Winner swaps:  {self.stats['swapped']}")
@@ -822,43 +625,25 @@
           logger.info("=" * 50)
 
 
-  # ======================================================================
-  =======
-  # Main Entry Point
-  # ======================================================================
-  =======
   def main():
-      """Main entry point for the scraper."""
       config = load_config()
-
       if not config.supabase_url or not config.supabase_key:
           logger.error("Missing SUPABASE_URL or 
   SUPABASE_SERVICE_ROLE_KEY")
           return
-
       if not config.anthropic_key:
           logger.error("Missing ANTHROPIC_API_KEY")
           return
 
       scraper = BOAMPDailyScraper(config)
-
-      # Default: scrape last 7 days
       end_date = datetime.now()
       start_date = end_date - timedelta(days=7)
-
       logger.info(f"Starting BOAMP scraper: {start_date.date()} to 
   {end_date.date()}")
-
       result = scraper.scrape_date_range(start_date, end_date)
-
       scraper.print_stats()
-
       logger.info(f"Completed! Total saved: {result['total_saved']}")
 
 
   if __name__ == '__main__':
       main()
-
-
-
-
